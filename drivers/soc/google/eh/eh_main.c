@@ -308,16 +308,22 @@ static int eh_reset(struct eh_device *eh_dev)
 	return 1;
 }
 
+static void eh_setup_src_addr(struct eh_compress_desc *desc, struct page *page)
+{
+	phys_addr_t src_paddr = page_to_phys(page);
+
+	/* Update the source address field in the descriptor */
+	desc->src_addr &= ~EH_COMP_SRC_ADDR_MASK;
+	desc->src_addr |= (src_paddr & EH_COMP_SRC_ADDR_MASK);
+}
 static void eh_setup_descriptor(struct eh_device *eh_dev, struct page *src_page,
 				unsigned int index)
 {
 	struct eh_compress_desc *desc;
-	phys_addr_t src_paddr;
 
 	desc = eh_descriptor(eh_dev, index);
-	src_paddr = page_to_phys(src_page);
-
-	desc->src_addr = src_paddr;
+	/* Set the source address */
+	eh_setup_src_addr(desc, src_page);
 	/* mark it as pend for hardware */
 	desc->status = EH_CDESC_PENDING;
 	/*
@@ -419,7 +425,7 @@ static void request_to_sw_fifo(struct eh_device *eh_dev,
 	req->priv = priv;
 
 	spin_lock(&fifo->lock);
-	list_add(&req->list, &fifo->head);
+	list_add_tail(&req->list, &fifo->head);
 	fifo->count++;
 	spin_unlock(&fifo->lock);
 	wake_up(&eh_dev->comp_wq);
@@ -662,11 +668,18 @@ static void eh_abort_incomplete_descriptors(struct eh_device *eh_dev)
 	}
 }
 
+static bool ready_to_run(struct eh_device *eh_dev, bool *slept)
+{
+	if (atomic_read(&eh_dev->nr_request) || !sw_fifo_empty(&eh_dev->sw_fifo))
+		return true;
+
+	*slept = true;
+	return false;
+}
+
 static int eh_comp_thread(void *data)
 {
 	struct eh_device *eh_dev = data;
-	DEFINE_WAIT(wait);
-	int nr_processed = 0;
 	struct sched_attr attr = {
 		.sched_policy = SCHED_NORMAL,
 		.sched_nice = -10,
@@ -674,24 +687,21 @@ static int eh_comp_thread(void *data)
 
 	WARN_ON_ONCE(sched_setattr_nocheck(current, &attr) != 0);
 	current->flags |= PF_MEMALLOC;
+	set_freezable();
 
 	while (!kthread_should_stop()) {
 		int ret;
+		bool slept = false;
 
-		prepare_to_wait(&eh_dev->comp_wq, &wait, TASK_IDLE);
-		if (atomic_read(&eh_dev->nr_request) == 0 &&
-		    sw_fifo_empty(&eh_dev->sw_fifo)) {
-			eh_dev->nr_compressed += nr_processed;
-			schedule();
-			nr_processed = 0;
-			/*
-			 * The condition check above is racy so the schedule
-			 * couldn't schedule out the process but it should be
-			 * rare and the stat doesn't need to be precise.
-			 */
+		wait_event_freezable(eh_dev->comp_wq, ready_to_run(eh_dev, &slept));
+
+		/*
+		 * The condition check above is racy so the schedule
+		 * couldn't schedule out the process but it should be
+		 * rare and the stat doesn't need to be precise.
+		 */
+		if (slept)
 			eh_dev->nr_run++;
-		}
-		finish_wait(&eh_dev->comp_wq, &wait);
 
 		ret = eh_process_compress(eh_dev);
 		if (unlikely(ret < 0)) {
@@ -719,11 +729,11 @@ static int eh_comp_thread(void *data)
 		 */
 		if (ret == 0)
 			usleep_range(5, 10);
+		else
+			eh_dev->nr_compressed += ret;
 
 		if (!fifo_full(eh_dev))
 			flush_sw_fifo(eh_dev);
-
-		nr_processed += ret;
 	}
 
 	return 0;

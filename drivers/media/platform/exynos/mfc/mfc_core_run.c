@@ -514,7 +514,7 @@ int mfc_core_run_enc_frame(struct mfc_core *core, struct mfc_ctx *ctx)
 
 		mfc_core_set_enc_src_sbwc(core,
 			(is_uncomp ? MFC_ENC_SRC_SBWC_OFF : MFC_ENC_SRC_SBWC_ON));
-		mfc_set_linear_stride_size(ctx,
+		mfc_set_linear_stride_size(ctx, &ctx->raw_buf,
 			(is_uncomp ? enc->uncomp_fmt : ctx->src_fmt));
 		mfc_core_set_enc_stride(core, ctx);
 	}
@@ -592,8 +592,7 @@ int mfc_core_run_enc_last_frames(struct mfc_core *core, struct mfc_ctx *ctx)
 		mfc_debug(2, "no dst buffers set to zero\n");
 
 		if (mfc_core_get_enc_bframe(ctx)) {
-			mfc_ctx_info("B frame encoding should be dst buffer\n");
-			return -EINVAL;
+			mfc_ctx_info("B frame encoding doesn't have dst buffer\n");
 		}
 	}
 

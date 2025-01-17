@@ -114,36 +114,13 @@ err:
 	return -EINVAL;
 }
 
-static int dwc3_exynos_clk_prepare(struct dwc3_exynos *exynos)
+static int dwc3_exynos_clk_prepare_enable(struct dwc3_exynos *exynos)
 {
 	int i;
 	int ret;
 
 	for (i = 0; exynos->clocks[i]; i++) {
-		ret = clk_prepare(exynos->clocks[i]);
-		if (ret)
-			goto err;
-	}
-
-	return 0;
-
-err:
-	dev_err(exynos->dev, "couldn't prepare clock[%d]\n", i);
-
-	/* roll back */
-	for (i = i - 1; i >= 0; i--)
-		clk_unprepare(exynos->clocks[i]);
-
-	return ret;
-}
-
-static int dwc3_exynos_clk_enable(struct dwc3_exynos *exynos)
-{
-	int i;
-	int ret;
-
-	for (i = 0; exynos->clocks[i]; i++) {
-		ret = clk_enable(exynos->clocks[i]);
+		ret = clk_prepare_enable(exynos->clocks[i]);
 		if (ret)
 			goto err;
 	}
@@ -155,25 +132,18 @@ err:
 
 	/* roll back */
 	for (i = i - 1; i >= 0; i--)
-		clk_disable(exynos->clocks[i]);
+		clk_disable_unprepare(exynos->clocks[i]);
 
 	return ret;
 }
 
-static void dwc3_exynos_clk_unprepare(struct dwc3_exynos *exynos)
+static void dwc3_exynos_clk_disable_unprepare(struct dwc3_exynos *exynos)
 {
 	int i;
 
-	for (i = 0; exynos->clocks[i]; i++)
-		clk_unprepare(exynos->clocks[i]);
-}
-
-static void dwc3_exynos_clk_disable(struct dwc3_exynos *exynos)
-{
-	int i;
-
-	for (i = 0; exynos->clocks[i]; i++)
-		clk_disable(exynos->clocks[i]);
+	for (i = 0; exynos->clocks[i]; i++){
+		clk_disable_unprepare(exynos->clocks[i]);
+	}
 }
 
 static void dwc3_core_config(struct dwc3 *dwc, struct dwc3_exynos *exynos)
@@ -884,6 +854,7 @@ static int dwc3_exynos_get_properties(struct dwc3_exynos *exynos)
 
 /* -------------------------------------------------------------------------- */
 
+/* Current data role is updated after the data role change has been completed */
 static ssize_t
 dwc3_exynos_otg_state_show(struct device *dev,
 		struct device_attribute *attr, char *buf)
@@ -1057,6 +1028,33 @@ static ssize_t dwc3_exynos_gadget_state_show(struct device *dev, struct device_a
 }
 static DEVICE_ATTR_RO(dwc3_exynos_gadget_state);
 
+/* New data role is updated before the data role change is executed */
+static const char * const usb_roles[] = {
+	[USB_ROLE_NONE]		= "none",
+	[USB_ROLE_HOST]		= "host",
+	[USB_ROLE_DEVICE]	= "device",
+};
+
+static const char *usb_role_string(enum usb_role role)
+{
+	if (role < 0 || role >= ARRAY_SIZE(usb_roles))
+		return "unknown";
+
+	return usb_roles[role];
+}
+
+static ssize_t
+new_data_role_show(struct device *dev,
+		struct device_attribute *attr, char *buf)
+{
+	struct dwc3_exynos	*exynos = dev_get_drvdata(dev);
+	struct dwc3_otg		*dotg = exynos->dotg;
+
+	return sysfs_emit(buf, "%s", usb_role_string(dotg->desired_role));
+}
+
+static DEVICE_ATTR_RO(new_data_role);
+
 static struct attribute *dwc3_exynos_otg_attrs[] = {
 	&dev_attr_dwc3_exynos_otg_id.attr,
 	&dev_attr_dwc3_exynos_otg_b_sess.attr,
@@ -1065,6 +1063,7 @@ static struct attribute *dwc3_exynos_otg_attrs[] = {
 	&dev_attr_usb_data_enabled.attr,
 	&dev_attr_force_speed.attr,
 	&dev_attr_dwc3_exynos_gadget_state.attr,
+	&dev_attr_new_data_role.attr,
 	NULL
 };
 ATTRIBUTE_GROUPS(dwc3_exynos_otg);
@@ -1080,7 +1079,7 @@ static int dwc3_exynos_probe(struct platform_device *pdev)
 
 	temp_usb_phy = devm_phy_get(dev, "usb2-phy");
 	if (IS_ERR(temp_usb_phy)) {
-		dev_dbg(dev, "USB phy is not probed - defered return!\n");
+		dev_dbg(dev, "USB phy is not probed - deferred return!\n");
 		return  -EPROBE_DEFER;
 	}
 
@@ -1090,6 +1089,11 @@ static int dwc3_exynos_probe(struct platform_device *pdev)
 			return -EPROBE_DEFER;
 		else if (ret)
 			return ret;
+	}
+
+	if (!exynos_pd_hsi0_get_ldo_status()) {
+		dev_err(dev, "pd-hsi0 is not powered, defered probe!");
+		return -EPROBE_DEFER;
 	}
 
 	exynos = devm_kzalloc(dev, sizeof(*exynos), GFP_KERNEL);
@@ -1112,16 +1116,6 @@ static int dwc3_exynos_probe(struct platform_device *pdev)
 	ret = dwc3_exynos_clk_get(exynos);
 	if (ret)
 		return ret;
-
-	ret = dwc3_exynos_clk_prepare(exynos);
-	if (ret)
-		return ret;
-
-	ret = dwc3_exynos_clk_enable(exynos);
-	if (ret) {
-		dwc3_exynos_clk_unprepare(exynos);
-		return ret;
-	}
 
 	ret = dwc3_exynos_extcon_register(exynos);
 	if (ret < 0) {
@@ -1156,8 +1150,6 @@ static int dwc3_exynos_probe(struct platform_device *pdev)
 		goto vdd33_err;
 	}
 
-	exynos_usbdrd_vdd_hsi_manual_control(1);
-	exynos_usbdrd_ldo_manual_control(1);
 	exynos_usbdrd_s2mpu_manual_control(1);
 
 	if (node) {
@@ -1221,8 +1213,7 @@ populate_err:
 	platform_device_unregister(exynos->usb2_phy);
 	platform_device_unregister(exynos->usb3_phy);
 vdd33_err:
-	dwc3_exynos_clk_disable(exynos);
-	dwc3_exynos_clk_unprepare(exynos);
+	dwc3_exynos_clk_disable_unprepare(exynos);
 	exynos_update_ip_idle_status(exynos->idle_ip_index, 1);
 	pm_runtime_put_sync(&pdev->dev);
 	pm_runtime_disable(&pdev->dev);
@@ -1251,11 +1242,9 @@ static int dwc3_exynos_remove(struct platform_device *pdev)
 
 	pm_runtime_disable(&pdev->dev);
 	if (!pm_runtime_status_suspended(&pdev->dev)) {
-		dwc3_exynos_clk_disable(exynos);
+		dwc3_exynos_clk_disable_unprepare(exynos);
 		pm_runtime_set_suspended(&pdev->dev);
 	}
-
-	dwc3_exynos_clk_unprepare(exynos);
 
 	return 0;
 }
@@ -1354,22 +1343,20 @@ static int dwc3_exynos_runtime_suspend(struct device *dev)
 	if (!exynos)
 		return 0;
 
-	dwc = exynos->dwc;
-	spin_lock_irqsave(&dwc->lock, flags);
-	if (pm_runtime_suspended(dev)) {
-		spin_unlock_irqrestore(&dwc->lock, flags);
+	if (pm_runtime_suspended(dev))
 		return 0;
-	}
 
-	dwc3_exynos_clk_disable(exynos);
+	dwc3_exynos_clk_disable_unprepare(exynos);
 
 	/* inform what USB state is idle to IDLE_IP */
 	exynos_update_ip_idle_status(exynos->idle_ip_index, 1);
 
-	/* After disconnecting calble, it will ignore core operations like
+	dwc = exynos->dwc;
+	spin_lock_irqsave(&dwc->lock, flags);
+	/* After disconnecting cable, it will ignore core operations like
 	 * dwc3_suspend/resume in core.c
 	 */
-	exynos->dwc->current_dr_role = DWC3_EXYNOS_IGNORE_CORE_OPS;
+	dwc->current_dr_role = DWC3_EXYNOS_IGNORE_CORE_OPS;
 	spin_unlock_irqrestore(&dwc->lock, flags);
 
 	return 0;
@@ -1389,9 +1376,9 @@ static int dwc3_exynos_runtime_resume(struct device *dev)
 	/* inform what USB state is not idle to IDLE_IP */
 	exynos_update_ip_idle_status(exynos->idle_ip_index, 0);
 
-	ret = dwc3_exynos_clk_enable(exynos);
+	ret = dwc3_exynos_clk_prepare_enable(exynos);
 	if (ret) {
-		dev_err(dev, "%s: clk_enable failed\n", __func__);
+		dev_err(dev, "%s: clk_prepare_enable failed\n", __func__);
 		return ret;
 	}
 
@@ -1408,7 +1395,7 @@ static int dwc3_exynos_suspend(struct device *dev)
 	if (pm_runtime_suspended(dev))
 		return 0;
 
-	dwc3_exynos_clk_disable(exynos);
+	dwc3_exynos_clk_disable_unprepare(exynos);
 
 	return 0;
 }
@@ -1418,9 +1405,9 @@ static int dwc3_exynos_resume(struct device *dev)
 	struct dwc3_exynos *exynos = dev_get_drvdata(dev);
 	int		ret;
 
-	ret = dwc3_exynos_clk_enable(exynos);
+	ret = dwc3_exynos_clk_prepare_enable(exynos);
 	if (ret) {
-		dev_err(dev, "%s: clk_enable failed\n", __func__);
+		dev_err(dev, "%s: clk_prepare_enable failed\n", __func__);
 		return ret;
 	}
 

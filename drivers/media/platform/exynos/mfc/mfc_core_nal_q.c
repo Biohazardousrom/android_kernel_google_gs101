@@ -563,11 +563,15 @@ static void __mfc_core_nal_q_set_min_bit_count(struct mfc_ctx *ctx, EncoderInput
 	struct mfc_enc *enc = ctx->enc_priv;
 	struct mfc_enc_params *p = &enc->params;
 
+	/* only enable min bit count when target bitrate over 100kbps */
+	if (p->rc_bitrate < VT_MIN_BITRATE)
+		return;
+
 	pInStr->BitCountEnable &= ~0x1;
 	pInStr->BitCountEnable |= 0x1;
 
 	if (p->rc_framerate)
-		pInStr->MinBitCount = (3500 * 30) / p->rc_framerate;
+		pInStr->MinBitCount = VT_MIN_BITRATE / p->rc_framerate;
 }
 
 static void __mfc_core_nal_q_set_slice_mode(struct mfc_ctx *ctx, EncoderInputStr *pInStr)
@@ -608,6 +612,58 @@ static void __mfc_core_nal_q_set_enc_config_qp(struct mfc_ctx *ctx,
 		pInStr->FixedPictureQp |= (enc->config_qp & 0xFF) << 24;
 		mfc_debug(6, "[NALQ][CTRLS] Dynamic QP changed %#x\n",
 				pInStr->FixedPictureQp);
+	}
+}
+
+static void __mfc_core_nal_q_get_dec_metadata_sei_nal(struct mfc_core *core, struct mfc_ctx *ctx,
+					DecoderOutputStr *pOutStr, unsigned int index)
+{
+	struct mfc_dec *dec = ctx->dec_priv;
+	dma_addr_t buf_addr;
+	dma_addr_t offset;
+	unsigned int *sei_addr = NULL;
+	unsigned int *addr;
+	int buf_size, sei_size;
+
+	addr = HDR10_PLUS_ADDR(dec->hdr10_plus_full, index);
+
+	buf_addr = pOutStr->MetadataAddrSeiMb;
+	buf_size = pOutStr->MetadataSizeSeiMb;
+	if (!buf_addr) {
+		mfc_ctx_err("[NALQ][META] The metadata address is NULL\n");
+		return;
+	}
+
+	offset = buf_addr - ctx->metadata_buf.daddr;
+	if (offset < 0) {
+		mfc_ctx_err("[NALQ][HDR+][META] The metadata offset %#llx is wrong\n", offset);
+		return;
+	}
+
+	/* SEI data - 0x0: payload type, 0x4: payload size, 0x8: payload data */
+	sei_addr = ctx->metadata_buf.vaddr + offset + MFC_META_SEI_NAL_SIZE_OFFSET;
+	sei_size = *sei_addr;
+
+	/* If there is other SEI data, need to use it for purpose */
+	if (sei_size != (buf_size - MFC_META_SEI_NAL_PAYLOAD_OFFSET))
+		mfc_ctx_err("[NALQ][HDR+][META] There is another SEI data (%d / %d)\n",
+				sei_size, buf_size);
+
+	/* HAL needs SEI data size info "size(4 bytes) + SEI data" */
+	sei_size += MFC_META_SEI_NAL_SIZE_OFFSET;
+	mfc_debug(2, "[NALQ][HDR+][META] copy metadata offset %pad size: %d / %d\n",
+			&offset, sei_size, buf_size);
+
+	memcpy(addr, sei_addr, sei_size);
+
+	if (hdr_dump == 1) {
+		mfc_ctx_err("[NALQ][HDR+][DUMP] F/W data (offset %pad)....\n", &offset);
+		print_hex_dump(KERN_ERR, "", DUMP_PREFIX_OFFSET, 32, 4,
+				&ctx->metadata_buf.vaddr + offset,
+				buf_size, false);
+		mfc_ctx_err("[NALQ][HDR+][DUMP] DRV data (idx %d)....\n", index);
+		print_hex_dump(KERN_ERR, "", DUMP_PREFIX_OFFSET, 32, 4, addr,
+				sei_size, false);
 	}
 }
 
@@ -1078,7 +1134,8 @@ static int __mfc_core_nal_q_run_in_buf_enc(struct mfc_core *core, struct mfc_cor
 			pInStr->ParamChange |= (MFC_ENC_SRC_SBWC_ON << 14);
 		}
 
-		mfc_set_linear_stride_size(ctx, (is_uncomp ? enc->uncomp_fmt : ctx->src_fmt));
+		mfc_set_linear_stride_size(ctx, &ctx->raw_buf,
+				(is_uncomp ? enc->uncomp_fmt : ctx->src_fmt));
 
 		for (i = 0; i < raw->num_planes; i++) {
 			pInStr->SourcePlaneStride[i] = raw->stride[i];
@@ -1603,7 +1660,8 @@ static void __mfc_core_nal_q_handle_frame_unused_output(struct mfc_ctx *ctx,
 				UNUSED_TAG);
 
 		dec->ref_buf[dec->refcnt].fd[0] = mfc_buf->vb.vb2_buf.planes[0].m.fd;
-		dec->refcnt++;
+		if (dec->refcnt < MFC_MAX_BUFFERS - 1)
+			dec->refcnt++;
 
 		vb2_buffer_done(&mfc_buf->vb.vb2_buf, VB2_BUF_STATE_DONE);
 		mfc_debug(2, "[NALQ][DPB] dst index [%d][%d] fd: %d is buffer done (not used)\n",
@@ -1723,7 +1781,7 @@ static void __mfc_core_nal_q_get_img_size(struct mfc_core *core, struct mfc_ctx 
 			ctx->raw_buf.stride_2bits[i] = pOutStr->Dpb2bitStrideSize[i];
 	}
 
-	mfc_debug(2, "[NALQ][FRAME] resolution changed, %dx%d => %dx%d (stride: %d)\n", w, h,
+	mfc_debug(2, "[NALQ][FRAME][DRC] resolution changed, %dx%d => %dx%d (stride: %d)\n", w, h,
 			ctx->img_width, ctx->img_height, ctx->raw_buf.stride[0]);
 
 	if (img_size == MFC_GET_RESOL_DPB_SIZE) {
@@ -1754,6 +1812,7 @@ static struct mfc_buf *__mfc_core_nal_q_handle_frame_output_del(struct mfc_core 
 	unsigned int is_hdr10_plus_sei = 0, is_av1_film_grain_sei = 0;
 	unsigned int is_disp_res_change = 0;
 	unsigned int disp_err;
+	unsigned int is_hdr10_plus_full = 0;
 	unsigned int is_uncomp = 0;
 	int i, index, idr_flag;
 
@@ -1776,6 +1835,10 @@ static struct mfc_buf *__mfc_core_nal_q_handle_frame_output_del(struct mfc_core 
 	if (MFC_FEATURE_SUPPORT(dev, dev->pdata->hdr10_plus))
 		is_hdr10_plus_sei = ((pOutStr->SeiAvail >> MFC_REG_D_SEI_AVAIL_ST_2094_40_SHIFT)
 					& MFC_REG_D_SEI_AVAIL_ST_2094_40_MASK);
+
+	if (MFC_FEATURE_SUPPORT(dev, dev->pdata->hdr10_plus_full))
+		is_hdr10_plus_full = ((pOutStr->MetadataStatus >> MFC_REG_SEI_NAL_STATUS_SHIFT)
+					& MFC_REG_SEI_NAL_STATUS_MASK);
 
 	if (MFC_FEATURE_SUPPORT(dev, dev->pdata->av1_film_grain))
 		is_av1_film_grain_sei = ((pOutStr->SeiAvail >> MFC_REG_D_SEI_AVAIL_FILM_GRAIN_SHIFT)
@@ -1863,11 +1926,14 @@ static struct mfc_buf *__mfc_core_nal_q_handle_frame_output_del(struct mfc_core 
 		}
 
 		if (is_disp_res_change) {
-			mfc_ctx_info("[NALQ][FRAME] display resolution changed\n");
+			mfc_ctx_info("[NALQ][FRAME][DRC] display resolution changed\n");
+			mutex_lock(&ctx->drc_wait_mutex);
 			ctx->wait_state = WAIT_G_FMT;
 			__mfc_core_nal_q_get_img_size(core, ctx, pOutStr, MFC_GET_RESOL_SIZE);
-			dec->disp_res_change = 1;
+			dec->disp_res_change++;
+			mfc_debug(2, "[NALQ][DRC] disp_res_change %d\n", dec->disp_res_change);
 			mfc_set_mb_flag(dst_mb, MFC_FLAG_DISP_RES_CHANGE);
+			mutex_unlock(&ctx->drc_wait_mutex);
 		}
 
 		if (is_hdr10_plus_sei) {
@@ -1881,6 +1947,17 @@ static struct mfc_buf *__mfc_core_nal_q_handle_frame_output_del(struct mfc_core 
 		} else {
 			if (dec->hdr10_plus_info)
 				dec->hdr10_plus_info[index].valid = 0;
+		}
+
+		if (is_hdr10_plus_full) {
+			if (dec->hdr10_plus_full) {
+				__mfc_core_nal_q_get_dec_metadata_sei_nal(core, ctx, pOutStr,
+						index);
+				mfc_set_mb_flag(dst_mb, MFC_FLAG_HDR_PLUS);
+				mfc_debug(2, "[NALQ][HDR+] HDR10 plus full SEI metadata parsed\n");
+			} else {
+				mfc_ctx_err("[NALQ][HDR+] HDR10 plus full cannot be copied\n");
+			}
 		}
 
 		if (is_av1_film_grain_sei) {
@@ -2045,7 +2122,8 @@ static void __mfc_core_nal_q_handle_released_buf(struct mfc_core *core, struct m
 			dec->dpb[i].ref = 0;
 			if (dec->dpb[i].queued && (dec->dpb[i].new_fd != -1)) {
 				dec->ref_buf[dec->refcnt].fd[0] = dec->dpb[i].fd[0];
-				dec->refcnt++;
+				if (dec->refcnt < MFC_MAX_BUFFERS - 1)
+					dec->refcnt++;
 				mfc_debug(3, "[NALQ][REFINFO] Queued DPB[%d] released fd: %d\n",
 						i, dec->dpb[i].fd[0]);
 				dec->dpb[i].fd[0] = dec->dpb[i].new_fd;
@@ -2054,7 +2132,8 @@ static void __mfc_core_nal_q_handle_released_buf(struct mfc_core *core, struct m
 						i, dec->dpb[i].fd[0]);
 			} else if (!dec->dpb[i].queued) {
 				dec->ref_buf[dec->refcnt].fd[0] = dec->dpb[i].fd[0];
-				dec->refcnt++;
+				if (dec->refcnt < MFC_MAX_BUFFERS - 1)
+					dec->refcnt++;
 				mfc_debug(3, "[NALQ][REFINFO] Dqueued DPB[%d] released fd: %d\n",
 						i, dec->dpb[i].fd[0]);
 				/*
@@ -2080,7 +2159,8 @@ static void __mfc_core_nal_q_handle_released_buf(struct mfc_core *core, struct m
 		if (!(dec->dynamic_used & (1UL << i)) && dec->dpb[i].mapcnt
 				&& !dec->dpb[i].queued) {
 			dec->ref_buf[dec->refcnt].fd[0] = dec->dpb[i].fd[0];
-			dec->refcnt++;
+			if (dec->refcnt < MFC_MAX_BUFFERS - 1)
+				dec->refcnt++;
 			mfc_debug(3, "[NALQ][REFINFO] display DPB[%d] released fd: %d\n",
 					i, dec->dpb[i].fd[0]);
 			dec->dpb_table_used &= ~(1UL << i);
@@ -2126,6 +2206,7 @@ static struct mfc_buf *__mfc_core_nal_q_handle_frame_output(struct mfc_core *cor
 static void __mfc_core_nal_q_handle_frame_input(struct mfc_core *core, struct mfc_ctx *ctx,
 			unsigned int err, DecoderOutputStr *pOutStr)
 {
+	struct mfc_dev *dev = ctx->dev;
 	struct mfc_dec *dec = ctx->dec_priv;
 	struct mfc_buf *src_mb;
 	unsigned int index;
@@ -2220,6 +2301,15 @@ static void __mfc_core_nal_q_handle_frame_input(struct mfc_core *core, struct mf
 		}
 	}
 
+	/* If pic_output_flag is 0 in HEVC, it is no destination buffer */
+	if (IS_HEVC_DEC(ctx) &&
+			MFC_FEATURE_SUPPORT(dev, dev->pdata->hevc_pic_output_flag) &&
+			!((pOutStr->HevcInfo >> MFC_REG_D_HEVC_INFO_PIC_OUTPUT_FLAG_SHIFT)
+				& MFC_REG_D_HEVC_INFO_PIC_OUTPUT_FLAG_MASK)) {
+		mfc_set_mb_flag(src_mb, MFC_FLAG_CONSUMED_ONLY);
+		mfc_debug(2, "[NALQ][STREAM] HEVC pic_output_flag off has no buffer to DQ\n");
+	}
+
 	if ((dst_frame_status == MFC_REG_DEC_STATUS_DECODING_ONLY) &&
 			(pOutStr->DecodedAddr[0] == 0)) {
 		mfc_set_mb_flag(src_mb, MFC_FLAG_CONSUMED_ONLY);
@@ -2293,11 +2383,13 @@ void __mfc_core_nal_q_handle_frame(struct mfc_core *core, struct mfc_core_ctx *c
 	}
 	if (res_change) {
 		mfc_debug(2, "[NALQ][DRC] Resolution change set to %d\n", res_change);
+		mutex_lock(&ctx->drc_wait_mutex);
 		mfc_change_state(core_ctx, MFCINST_RES_CHANGE_INIT);
 		ctx->wait_state = WAIT_G_FMT | WAIT_STOP;
 		core->nal_q_stop_cause |= (1 << NALQ_EXCEPTION_DRC);
 		core->nal_q_handle->nal_q_exception = 1;
 		mfc_ctx_info("[NALQ][DRC] nal_q_exception is set (res change)\n");
+		mutex_unlock(&ctx->drc_wait_mutex);
 		goto leave_handle_frame;
 	}
 	if (need_empty_dpb) {
@@ -2305,17 +2397,23 @@ void __mfc_core_nal_q_handle_frame(struct mfc_core *core, struct mfc_core_ctx *c
 		dec->has_multiframe = 1;
 		core->nal_q_stop_cause |= (1 << NALQ_EXCEPTION_NEED_DPB);
 		core->nal_q_handle->nal_q_exception = 1;
-		mfc_ctx_info("[NALQ][MULTIFRAME] nal_q_exception is set\n");
+		if (dec->is_multiframe)
+			mfc_debug(2, "[NALQ][MULTIFRAME] nal_q_exception is set\n");
+		else
+			mfc_ctx_info("[NALQ][MULTIFRAME] nal_q_exception is set\n");
+		dec->is_multiframe = 1;
 		goto leave_handle_frame;
 	}
 	if (need_dpb_change || need_scratch_change) {
 		mfc_ctx_info("[NALQ][DRC] Interframe resolution changed\n");
+		mutex_lock(&ctx->drc_wait_mutex);
 		ctx->wait_state = WAIT_G_FMT | WAIT_STOP;
 		__mfc_core_nal_q_get_img_size(core, ctx, pOutStr, MFC_GET_RESOL_DPB_SIZE);
 		dec->inter_res_change = 1;
 		mfc_ctx_info("[NALQ][DRC] nal_q_exception is set (interframe res change)\n");
 		core->nal_q_stop_cause |= (1 << NALQ_EXCEPTION_INTER_DRC);
 		core->nal_q_handle->nal_q_exception = 2;
+		mutex_unlock(&ctx->drc_wait_mutex);
 		goto leave_handle_frame;
 	}
 	if (is_interlaced && ctx->is_sbwc) {

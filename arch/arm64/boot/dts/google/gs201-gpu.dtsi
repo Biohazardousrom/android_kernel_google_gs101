@@ -9,7 +9,9 @@
 / {
 	mali_mgm: physical-memory-group-manager {
 		compatible = "arm,physical-memory-group-manager";
-		pt_id = "GPU";
+
+		/* SLC partitions */
+		pt_id = "gpu_write_alloc";
 	};
 
 	mali_pcm: priority-control-manager {

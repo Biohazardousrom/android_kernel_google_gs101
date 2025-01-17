@@ -194,7 +194,8 @@ static void __mfc_handle_frame_unused_output(struct mfc_core *core, struct mfc_c
 				UNUSED_TAG);
 
 		dec->ref_buf[dec->refcnt].fd[0] = mfc_buf->vb.vb2_buf.planes[0].m.fd;
-		dec->refcnt++;
+		if (dec->refcnt < MFC_MAX_BUFFERS - 1)
+			dec->refcnt++;
 
 		vb2_buffer_done(&mfc_buf->vb.vb2_buf, VB2_BUF_STATE_DONE);
 		mfc_debug(2, "[DPB] dst index [%d][%d] fd: %d is buffer done (not used)\n",
@@ -309,8 +310,9 @@ static struct mfc_buf *__mfc_handle_frame_output_del(struct mfc_core *core,
 	unsigned int is_video_signal_type = 0, is_colour_description = 0;
 	unsigned int is_content_light = 0, is_display_colour = 0;
 	unsigned int is_hdr10_plus_sei = 0, is_av1_film_grain_sei = 0;
+	unsigned int is_hdr10_plus_full = 0;
 	unsigned int is_uncomp = 0;
-	unsigned int i, index, idr_flag;
+	unsigned int i, index, idr_flag, is_last_display;
 
 	if (MFC_FEATURE_SUPPORT(dev, dev->pdata->color_aspect_dec)) {
 		is_video_signal_type = mfc_core_get_video_signal_type();
@@ -324,6 +326,9 @@ static struct mfc_buf *__mfc_handle_frame_output_del(struct mfc_core *core,
 
 	if (MFC_FEATURE_SUPPORT(dev, dev->pdata->hdr10_plus))
 		is_hdr10_plus_sei = mfc_core_get_sei_avail_st_2094_40();
+
+	if (MFC_FEATURE_SUPPORT(dev, dev->pdata->hdr10_plus_full))
+		is_hdr10_plus_full = mfc_core_get_sei_nal_meta_status();
 
 	if (MFC_FEATURE_SUPPORT(dev, dev->pdata->av1_film_grain))
 		is_av1_film_grain_sei = mfc_core_get_sei_avail_film_grain();
@@ -343,6 +348,8 @@ static struct mfc_buf *__mfc_handle_frame_output_del(struct mfc_core *core,
 		frame_type = mfc_core_get_disp_frame_type();
 		idr_flag = mfc_core_get_disp_idr_flag();
 	}
+
+	is_last_display = mfc_core_get_last_display();
 
 	if (MFC_FEATURE_SUPPORT(dev, dev->pdata->sbwc_uncomp) && ctx->is_sbwc)
 		is_uncomp = mfc_core_get_uncomp();
@@ -397,11 +404,14 @@ static struct mfc_buf *__mfc_handle_frame_output_del(struct mfc_core *core,
 
 		if ((IS_VP9_DEC(ctx) && mfc_core_get_disp_res_change()) ||
 			(IS_AV1_DEC(ctx) && mfc_core_get_disp_res_change_av1())) {
-			mfc_ctx_info("[FRAME] display resolution changed\n");
+			mfc_ctx_info("[FRAME][DRC] display resolution changed\n");
+			mutex_lock(&ctx->drc_wait_mutex);
 			ctx->wait_state = WAIT_G_FMT;
 			mfc_core_get_img_size(core, ctx, MFC_GET_RESOL_SIZE);
-			dec->disp_res_change = 1;
+			dec->disp_res_change++;
+			mfc_debug(2, "[DRC] disp_res_change %d\n", dec->disp_res_change);
 			mfc_set_mb_flag(dst_mb, MFC_FLAG_DISP_RES_CHANGE);
+			mutex_unlock(&ctx->drc_wait_mutex);
 		}
 
 		if (dec->black_bar_updated) {
@@ -414,13 +424,23 @@ static struct mfc_buf *__mfc_handle_frame_output_del(struct mfc_core *core,
 				mfc_core_get_hdr_plus_info(core, ctx,
 						&dec->hdr10_plus_info[index]);
 				mfc_set_mb_flag(dst_mb, MFC_FLAG_HDR_PLUS);
-				mfc_debug(2, "[HDR+] HDR10 plus dyanmic SEI metadata parsed\n");
+				mfc_debug(2, "[HDR+] HDR10 plus dynamic SEI metadata parsed\n");
 			} else {
 				mfc_ctx_err("[HDR+] HDR10 plus cannot be copied\n");
 			}
 		} else {
 			if (dec->hdr10_plus_info)
 				dec->hdr10_plus_info[index].valid = 0;
+		}
+
+		if (is_hdr10_plus_full) {
+			if (dec->hdr10_plus_full) {
+				mfc_core_get_dec_metadata_sei_nal(core, ctx, index);
+				mfc_set_mb_flag(dst_mb, MFC_FLAG_HDR_PLUS);
+				mfc_debug(2, "[HDR+] HDR10 plus full SEI metadata parsed\n");
+			} else {
+				mfc_ctx_err("[HDR+] HDR10 plus full cannot be copied\n");
+			}
 		}
 
 		if (is_av1_film_grain_sei) {
@@ -435,7 +455,6 @@ static struct mfc_buf *__mfc_handle_frame_output_del(struct mfc_core *core,
 		} else {
 			if (dec->av1_film_grain_info)
 				dec->av1_film_grain_info[index].apply_grain = 0;
-
 		}
 
 		if (is_uncomp) {
@@ -447,6 +466,11 @@ static struct mfc_buf *__mfc_handle_frame_output_del(struct mfc_core *core,
 			mfc_set_mb_flag(dst_mb, MFC_FLAG_FRAMERATE_CH);
 			ctx->update_framerate = false;
 			mfc_debug(2, "[QoS] framerate changed\n");
+		}
+
+		if (is_last_display) {
+			mfc_set_mb_flag(dst_mb, MFC_FLAG_LAST_FRAME);
+			mfc_debug(2, "[FRAME] Last display frame\n");
 		}
 
 		if ((IS_VP9_DEC(ctx) || IS_AV1_DEC(ctx)) && dec->has_multiframe) {
@@ -571,7 +595,8 @@ static void __mfc_handle_released_buf(struct mfc_core *core, struct mfc_ctx *ctx
 			dec->dpb[i].ref = 0;
 			if (dec->dpb[i].queued && (dec->dpb[i].new_fd != -1)) {
 				dec->ref_buf[dec->refcnt].fd[0] = dec->dpb[i].fd[0];
-				dec->refcnt++;
+				if (dec->refcnt < MFC_MAX_BUFFERS - 1)
+					dec->refcnt++;
 				mfc_debug(3, "[REFINFO] Queued DPB[%d] released fd: %d\n",
 						i, dec->dpb[i].fd[0]);
 				dec->dpb[i].fd[0] = dec->dpb[i].new_fd;
@@ -580,7 +605,8 @@ static void __mfc_handle_released_buf(struct mfc_core *core, struct mfc_ctx *ctx
 						i, dec->dpb[i].fd[0]);
 			} else if (!dec->dpb[i].queued) {
 				dec->ref_buf[dec->refcnt].fd[0] = dec->dpb[i].fd[0];
-				dec->refcnt++;
+				if (dec->refcnt < MFC_MAX_BUFFERS - 1)
+					dec->refcnt++;
 				mfc_debug(3, "[REFINFO] Dqueued DPB[%d] released fd: %d\n",
 						i, dec->dpb[i].fd[0]);
 				/*
@@ -606,7 +632,8 @@ static void __mfc_handle_released_buf(struct mfc_core *core, struct mfc_ctx *ctx
 		if (!(dec->dynamic_used & (1UL << i)) && dec->dpb[i].mapcnt
 				&& !dec->dpb[i].queued) {
 			dec->ref_buf[dec->refcnt].fd[0] = dec->dpb[i].fd[0];
-			dec->refcnt++;
+			if (dec->refcnt < MFC_MAX_BUFFERS - 1)
+				dec->refcnt++;
 			mfc_debug(3, "[REFINFO] display DPB[%d] released fd: %d\n",
 					i, dec->dpb[i].fd[0]);
 			dec->dpb_table_used &= ~(1UL << i);
@@ -756,6 +783,10 @@ static void __mfc_handle_frame_error(struct mfc_core *core, struct mfc_ctx *ctx,
 	if (ctx->type == MFCINST_ENCODER) {
 		mfc_err("Encoder Interrupt Error (err: %d, warn: %d)\n",
 				mfc_get_err(err), mfc_get_warn(err));
+
+		if (mfc_get_err(err) == MFC_REG_ERR_UNDEFINED_EXCEPTION)
+			mfc_core_handle_error(core);
+
 		return;
 	}
 
@@ -802,6 +833,7 @@ static void __mfc_handle_frame_error(struct mfc_core *core, struct mfc_ctx *ctx,
 static void __mfc_handle_frame_input(struct mfc_core *core,
 		struct mfc_ctx *ctx, unsigned int err)
 {
+	struct mfc_dev *dev = ctx->dev;
 	struct mfc_core_ctx *core_ctx = core->core_ctx[ctx->num];
 	struct mfc_dec *dec = ctx->dec_priv;
 	struct mfc_buf *src_mb;
@@ -896,6 +928,14 @@ static void __mfc_handle_frame_input(struct mfc_core *core,
 		}
 	}
 
+	/* If pic_output_flag is 0 in HEVC, it is no destination buffer */
+	if (IS_HEVC_DEC(ctx) &&
+			MFC_FEATURE_SUPPORT(dev, dev->pdata->hevc_pic_output_flag) &&
+			!mfc_core_get_hevc_pic_output_flag()) {
+		mfc_set_mb_flag(src_mb, MFC_FLAG_CONSUMED_ONLY);
+		mfc_debug(2, "[STREAM] HEVC pic_output_flag off has no buffer to DQ\n");
+	}
+
 	if ((mfc_core_get_disp_status() == MFC_REG_DEC_STATUS_DECODING_ONLY) &&
 			(mfc_core_get_dec_y_addr() == 0)) {
 		mfc_set_mb_flag(src_mb, MFC_FLAG_CONSUMED_ONLY);
@@ -964,17 +1004,21 @@ static void __mfc_handle_frame(struct mfc_core *core, struct mfc_ctx *ctx,
 
 	if (res_change) {
 		mfc_debug(2, "[DRC] Resolution change set to %d\n", res_change);
+		mutex_lock(&ctx->drc_wait_mutex);
 		mfc_change_state(core_ctx, MFCINST_RES_CHANGE_INIT);
 		ctx->wait_state = WAIT_G_FMT | WAIT_STOP;
 		mfc_debug(2, "[DRC] Decoding waiting! : %d\n", ctx->wait_state);
+		mutex_unlock(&ctx->drc_wait_mutex);
 		return;
 	}
 
 	if (need_dpb_change || need_scratch_change) {
 		mfc_ctx_info("[DRC] Interframe resolution changed\n");
+		mutex_lock(&ctx->drc_wait_mutex);
 		ctx->wait_state = WAIT_G_FMT | WAIT_STOP;
 		mfc_core_get_img_size(core, ctx, MFC_GET_RESOL_DPB_SIZE);
 		dec->inter_res_change = 1;
+		mutex_unlock(&ctx->drc_wait_mutex);
 		__mfc_handle_frame_all_extracted(core, ctx);
 		return;
 	}
@@ -989,10 +1033,12 @@ static void __mfc_handle_frame(struct mfc_core *core, struct mfc_ctx *ctx,
 		dst_frame_status == MFC_REG_DEC_STATUS_DECODING_ONLY) {
 		mfc_debug(2, "Frame packing SEI exists for a frame\n");
 		mfc_debug(2, "Reallocate DPBs and issue init_buffer\n");
+		mutex_lock(&ctx->drc_wait_mutex);
 		ctx->is_dpb_realloc = 1;
 		mfc_change_state(core_ctx, MFCINST_HEAD_PARSED);
 		ctx->capture_state = QUEUE_FREE;
 		ctx->wait_state = WAIT_STOP;
+		mutex_unlock(&ctx->drc_wait_mutex);
 		__mfc_handle_frame_all_extracted(core, ctx);
 		goto leave_handle_frame;
 	}
@@ -1005,7 +1051,6 @@ static void __mfc_handle_frame(struct mfc_core *core, struct mfc_ctx *ctx,
 			mfc_debug(2, "[DRC] Last frame received after resolution change\n");
 			__mfc_handle_frame_all_extracted(core, ctx);
 			mfc_change_state(core_ctx, MFCINST_RES_CHANGE_END);
-			mfc_wake_up_drc_ctx(core_ctx);
 
 			if (IS_MULTI_CORE_DEVICE(dev))
 				mfc_rm_load_balancing(ctx, MFC_RM_LOAD_DELETE);
@@ -1929,6 +1974,7 @@ static int __mfc_irq_ctx(struct mfc_core *core, struct mfc_ctx *ctx,
 		break;
 	default:
 		mfc_err("Unknown int reason: %d\n", reason);
+		mfc_core_handle_error(core);
 	}
 
 	return 1;

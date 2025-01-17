@@ -190,6 +190,8 @@
 	((p->seq_hdr_mode == V4L2_MPEG_VIDEO_HEADER_MODE_JOINED_WITH_1ST_FRAME) || \
 	((IS_VP8_ENC(ctx) || IS_VP9_ENC(ctx)) && p->ivf_header_disable))
 
+#define HDR10_PLUS_ADDR(base, idx)	((base) + ((idx) * HDR10_PLUS_DATA_SIZE))
+
 /*
  levels with maximum property values
  level	Maximum frame size in MB (MB width x MB height)
@@ -251,6 +253,8 @@
 	((m == MFC_MATRIX_COEFF_BT2020) || (m == MFC_MATRIX_COEFF_BT2020_CONSTANT)) &&		\
 	((t == MFC_TRANSFER_SMPTE_170M) || (t == MFC_TRANSFER_ST2084) || (t == MFC_TRANSFER_HLG)))
 
+#define IS_NO_INFOLOG(ctx)		((ctx)->dec_priv && (ctx)->dec_priv->is_multiframe)
+
 /* Extra information for Decoder */
 #define	DEC_SET_DUAL_DPB		(1 << 0)
 #define	DEC_SET_DYNAMIC_DPB		(1 << 1)
@@ -261,6 +265,7 @@
 #define	DEC_SET_C2_INTERFACE		(1 << 6)
 #define DEC_SET_FRAME_ERR_TYPE		(1 << 7)
 #define DEC_SET_OPERATING_FPS		(1 << 8)
+#define DEC_SET_HDR10_PLUS_FULL		(1 << 9)
 #define DEC_SET_BUF_FLAG_CTRL		(1 << 16)
 #define DEC_SET_PRIORITY		(1 << 23)
 
@@ -294,5 +299,8 @@
 /* Low memory check */
 #define IS_LOW_MEM			(totalram_pages() <= ((SZ_1G + SZ_512M) >> PAGE_SHIFT))
 #define SZ_600M				(6 * 1024 * 1024)
+
+/* Min Bitrate for VT (100kbps) */
+#define VT_MIN_BITRATE			(3500 * 30)
 
 #endif /* __MFC_COMMON_H */

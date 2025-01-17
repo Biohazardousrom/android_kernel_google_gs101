@@ -178,24 +178,20 @@ int mfc_core_get_hwlock_dev(struct mfc_core *core)
 	int ret = 0;
 	unsigned long flags;
 
-	mutex_lock(&core->hwlock_wq.wait_mutex);
-
-	spin_lock_irqsave(&core->hwlock.lock, flags);
-	__mfc_print_hwlock(core);
-
 	if (core->state == MFCCORE_ERROR) {
 		mfc_core_info("[MSR] Couldn't lock HW. It's Error state\n");
-		spin_unlock_irqrestore(&core->hwlock.lock, flags);
-		mutex_unlock(&core->hwlock_wq.wait_mutex);
 		return 0;
 	}
 
 	if (core->shutdown) {
 		mfc_core_info("Couldn't lock HW. Shutdown was called\n");
-		spin_unlock_irqrestore(&core->hwlock.lock, flags);
-		mutex_unlock(&core->hwlock_wq.wait_mutex);
 		return -EINVAL;
 	}
+
+	mutex_lock(&core->hwlock_wq.wait_mutex);
+
+	spin_lock_irqsave(&core->hwlock.lock, flags);
+	__mfc_print_hwlock(core);
 
 	if ((core->hwlock.bits != 0) || (core->hwlock.dev != 0)) {
 		list_add_tail(&core->hwlock_wq.list, &core->hwlock.waiting_list);
@@ -251,24 +247,20 @@ int mfc_core_get_hwlock_ctx(struct mfc_core_ctx *core_ctx)
 	int ret = 0;
 	unsigned long flags;
 
-	mutex_lock(&core_ctx->hwlock_wq.wait_mutex);
-
-	spin_lock_irqsave(&core->hwlock.lock, flags);
-	__mfc_print_hwlock(core);
-
 	if (core->state == MFCCORE_ERROR) {
 		mfc_core_info("[MSR] Couldn't lock HW. It's Error state\n");
-		spin_unlock_irqrestore(&core->hwlock.lock, flags);
-		mutex_unlock(&core->hwlock_wq.wait_mutex);
 		return 0;
 	}
 
 	if (core->shutdown) {
 		mfc_core_info("Couldn't lock HW. Shutdown was called\n");
-		spin_unlock_irqrestore(&core->hwlock.lock, flags);
-		mutex_unlock(&core_ctx->hwlock_wq.wait_mutex);
 		return -EINVAL;
 	}
+
+	mutex_lock(&core_ctx->hwlock_wq.wait_mutex);
+
+	spin_lock_irqsave(&core->hwlock.lock, flags);
+	__mfc_print_hwlock(core);
 
 	if (core->hwlock.migrate && core->hwlock.mig_core_ctx == core_ctx) {
 		mfc_core_info("Waiting for hwlock to be done migration\n");
@@ -615,6 +607,11 @@ void mfc_core_cache_flush(struct mfc_core *core, int is_drm,
 {
 	enum mfc_fw_status fw_status;
 
+	if (core->state == MFCCORE_ERROR) {
+		mfc_core_info("[MSR] Couldn't lock HW. It's Error state\n");
+		return;
+	}
+
 	/*
 	 * Even if it is determined that the attribute of the previous instance
 	 * and the current instance have been changed, (= drm_switch)
@@ -694,7 +691,10 @@ static int __mfc_nal_q_just_run(struct mfc_core *core, struct mfc_core_ctx *core
 				mfc_core_cache_flush(
 					core, ctx->is_drm, MFC_CACHEFLUSH, drm_switch, 0);
 
-			mfc_ctx_info("[NALQ] start NAL QUEUE\n");
+			if (IS_NO_INFOLOG(ctx))
+				mfc_debug(2, "[NALQ] start NAL QUEUE\n");
+			else
+				mfc_ctx_info("[NALQ] start NAL QUEUE\n");
 			mfc_core_nal_q_start(core, nal_q_handle);
 
 			if (mfc_core_nal_q_enqueue_in_buf(core, core_ctx, nal_q_handle->nal_q_in_handle)) {
@@ -723,7 +723,11 @@ static int __mfc_nal_q_just_run(struct mfc_core *core, struct mfc_core_ctx *core
 				nal_q_handle->nal_q_exception) {
 			/* disable NAL QUEUE */
 			mfc_core_nal_q_stop(core, nal_q_handle);
-			mfc_ctx_info("[NALQ] stop NAL QUEUE\n");
+
+			if (IS_NO_INFOLOG(ctx))
+				mfc_debug(2, "[NALQ] stop NAL QUEUE\n");
+			else
+				mfc_ctx_info("[NALQ] stop NAL QUEUE\n");
 			if (mfc_wait_for_done_core(core,
 					MFC_REG_R2H_CMD_COMPLETE_QUEUE_RET)) {
 				mfc_err("[NALQ] Failed to stop queue\n");
